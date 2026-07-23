@@ -3632,9 +3632,31 @@ async function loadData(forceRefresh = false) {
     const aba = STATE.currentClient.aba || 'A1:P10000';
     const range = aba.includes('!') ? aba : `${aba}!A1:P10000`;
     // Carregar dados da planilha do cliente usando a API Key da mestra
-    const rows = await loadSheet(STATE.currentClient.sheet_id, STATE.masterApiKey, range);
+    let rows = await loadSheet(STATE.currentClient.sheet_id, STATE.masterApiKey, range);
     STATE.rawRows = rows;
     STATE.positions = buildPositions(rows);
+    // Retry automático (v11): células com fórmula GOOGLEFINANCE (ATUAL_BRL de ações/
+    // ETFs/cripto) às vezes ainda não terminaram de recalcular no instante exato em
+    // que a API do Sheets é consultada, e voltam em branco/zero nessa primeira leitura
+    // — mesmo com APORTE e QTD corretos. Detectamos esse padrão (posição de RV com
+    // aporte > 0 e valor atual zerado) e refazemos UMA leitura extra após uma pequena
+    // pausa, que normalmente já vem com os valores recalculados.
+    const zeradosSuspeitos = STATE.positions.filter(p => RV_CLASSES.includes(p.tipo) && p.aporte > 0 && p.atual === 0);
+    if (zeradosSuspeitos.length) {
+      console.warn('[Dashboard] Posições com ATUAL_BRL zerado (fórmula GOOGLEFINANCE provavelmente ainda recalculando):',
+        zeradosSuspeitos.map(p => p.code), '— refazendo leitura em 2.5s...');
+      await new Promise(r => setTimeout(r, 2500));
+      rows = await loadSheet(STATE.currentClient.sheet_id, STATE.masterApiKey, range);
+      STATE.rawRows = rows;
+      STATE.positions = buildPositions(rows);
+      const aindaZerados = STATE.positions.filter(p => RV_CLASSES.includes(p.tipo) && p.aporte > 0 && p.atual === 0);
+      if (aindaZerados.length) {
+        console.warn('[Dashboard] Ainda zerado após retry (pode ser posição realmente liquidada, ou GOOGLEFINANCE lento):', aindaZerados.map(p => p.code));
+        showToast(`${aindaZerados.length} ativo(s) com valor zerado após retry — confira ou clique em Atualizar`, 'warn', 5000);
+      } else {
+        console.log('[Dashboard] Retry corrigiu os valores zerados.');
+      }
+    }
     const histResult = buildHistory(rows, STATE.positions) || {};
     STATE.history = Array.isArray(histResult.series) ? histResult.series : [];
     STATE.dailyReturns = Array.isArray(histResult.dailyReturns) ? histResult.dailyReturns : [];
