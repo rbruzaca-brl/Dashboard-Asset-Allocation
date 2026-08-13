@@ -2539,6 +2539,14 @@ function getMacroForClass(tipo) {
 // Também detecta classes não conformes (fora da lista canônica)
 // Obtém os alvos de classes considerando: 1) perfil selecionado, 2) overrides do usuário no settings
 function getClassTargetsForActiveProfile() {
+  // v13.1: quando o cliente tem alvos personalizados via CONFIG_JSON (não é o perfil
+  // genérico), usamos ESSES alvos direto — sem misturar com o perfil. Antes, o merge
+  // abaixo reintroduzia classes do perfil que o cliente não mencionou (ex: FIIs,
+  // Multimercados Brasil, Caixa Brasil), inflando a soma dos alvos para além de 100%.
+  // Classes ausentes no objeto são tratadas como alvo 0% por quem consome (|| 0).
+  if (STATE.settings.customTargetsActive) {
+    return { ...STATE.settings.classTargets };
+  }
   const perfil = STATE.settings.perfil || 'Conservador';
   const alvosPerfil = STATE.PERFIL_ALVOS[perfil] || STATE.PERFIL_ALVOS['Conservador'];
   // Merge: alvos do perfil como base + overrides do usuário (classTargets) para classes modificadas
@@ -2559,6 +2567,10 @@ function applyPerfilToSettings(perfil) {
   if (!STATE.PERFIL_ALVOS[perfil]) return;
   STATE.settings.perfil = perfil;
   STATE.settings.classTargets = { ...STATE.PERFIL_ALVOS[perfil] };
+  // v13.1: aplicar um perfil sempre reseta para os alvos "puros" do perfil — qualquer
+  // personalização por cliente (config_json) só volta a valer se applyClientConfig()
+  // rodar de novo em seguida (é isso que loadData/btnReload já fazem).
+  STATE.settings.customTargetsActive = false;
   console.log(`[Dashboard] Perfil aplicado: ${perfil}`, STATE.settings.classTargets);
 }
 
@@ -4774,7 +4786,13 @@ function applyClientConfig(client) {
   }
   try {
     const cfg = JSON.parse(client.config_json);
-    if (cfg.classTargets) STATE.settings.classTargets = { ...STATE.settings.classTargets, ...cfg.classTargets };
+    if (cfg.classTargets) {
+      // v13.1: substitui por completo (não mescla) — o CONFIG_JSON do cliente é a
+      // fonte da verdade quando presente; classes não mencionadas ficam em 0%, não
+      // herdam o valor do perfil genérico.
+      STATE.settings.classTargets = { ...cfg.classTargets };
+      STATE.settings.customTargetsActive = true;
+    }
     if (cfg.tolerance != null) STATE.settings.tolerance = cfg.tolerance;
     if (cfg.recCount != null) STATE.settings.recCount = cfg.recCount;
     if (cfg.benchmarks) STATE.settings.benchmarks = cfg.benchmarks;
