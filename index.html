@@ -393,6 +393,7 @@
     border:1px solid var(--border); color:var(--text-muted); flex-shrink:0; white-space:nowrap;
   }
   .cv-src.live { color:#22C55E; border-color:rgba(34,197,94,.45); background:rgba(34,197,94,.08); }
+  .cv-src.auto { color:#3B82F6; border-color:rgba(59,130,246,.45); background:rgba(59,130,246,.08); }
   .cv-classe { font-size:10px; color:var(--text-muted); text-transform:uppercase; letter-spacing:.04em; margin-bottom:8px; }
   .cv-price-row { display:flex; align-items:baseline; gap:8px; margin-bottom:6px; flex-wrap:wrap; }
   .cv-price { font-size:19px; font-weight:700; font-family:var(--font-mono, monospace); color:var(--text); letter-spacing:-.01em; }
@@ -1344,6 +1345,14 @@
       <div class="hint-box">Token gratuito em <strong>brapi.dev</strong> (~15.000 req/mês, 1 ticker por chamada, delay ~15min). Salvo apenas no seu navegador (nunca no código-fonte/repositório). As cotações afetam <strong>apenas</strong> a Carteira Viva — KPIs, IAP e histórico continuam baseados na planilha (ATUAL_BRL).</div>
     </div>
 
+    <div class="modal-section">
+      <h3>📈 Renda Fixa Automática</h3>
+      <label style="display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text); margin-bottom:8px; cursor:pointer;">
+        <input type="checkbox" id="rfAutoUpdateChk" style="accent-color:var(--accent);"> Projetar valor atual da renda fixa automaticamente (CDI/IPCA/Prefixado real)
+      </label>
+      <div class="hint-box">Em vez de depender do <code>ATUAL_BRL</code> digitado manualmente na planilha, calcula o valor de cada título compondo a taxa contratada (TX_RENT) sobre o CDI/IPCA real do BACEN desde a data do aporte. Ativos com taxa não reconhecida continuam usando o valor da planilha. Isso muda o Patrimônio, IAP e demais KPIs — desative para voltar a usar 100% os valores manuais da planilha.</div>
+    </div>
+
     <div class="modal-actions">
       <button class="btn" id="btnCloseSettings">Cancelar</button>
       <button class="btn btn-primary" id="btnSaveSettings">Salvar & Recalcular</button>
@@ -1467,6 +1476,9 @@ const STATE = {
     // É salvo apenas no localStorage do seu navegador — veja loadBrapiTokenLocal()/saveBrapiTokenLocal().
     brapiEnabled: true,
     brapiToken: '',  // preenchido em runtime a partir do localStorage local (ver IIFE abaixo) — configure em ⚙ Configurações
+    // Renda Fixa auto-atualizada (v12): projeta ATUAL_BRL usando a taxa contratada (TX_RENT)
+    // composta sobre o CDI/IPCA real (BACEN), em vez de depender de atualização manual na planilha.
+    rfAutoUpdate: true,
   },
   // Tabela de Asset Allocation por Perfil (alinhado com REGRAS_v15 e Modelo Unificado 1.0)
   // Cada perfil define os percentuais-alvo por classe (16 classes oficiais)
@@ -1522,7 +1534,7 @@ const ASSESSOR_PASSWORD = 'assessor2025';
    Botão "Atualizar" ignora o cache (force refresh).
 */
 // Versão do cache — bump quando há mudança de formato que invalida dados antigos
-const CACHE_VERSION = 'v10'; // v10: integração Brapi — Carteira Viva (cotações ao vivo + volatilidade)
+const CACHE_VERSION = 'v13'; // v13: corrige ordem perfil→config_json (personalização do cliente não era mais apagada)
 const CACHE_PREFIX = `dash_cache_${CACHE_VERSION}_`;
 const CACHE_TTL = {
   bacen: 24 * 60 * 60 * 1000,      // 24 horas
@@ -1955,6 +1967,7 @@ function drawCarteiraViva() {
     const q = STATE.brapi.quotes[p.code] || null;
     const hasQty = RV_CLASSES.includes(p.tipo) && p.totalQtd > 0 && p.precoUnit > 0;
     const live = !!q;
+    const rfAutoBadge = !live && p.rfAuto; // 'total' | 'parcial' | null — só exibido quando não é Brapi
     const liveValor = (q && hasQty) ? q.price * p.totalQtd : null;
     const valorExibido = liveValor != null ? liveValor : (p.valorMercado || 0);
     const pct = totalPatrim > 0 ? ((p.valorMercado || 0) / totalPatrim) * 100 : 0;
@@ -2010,7 +2023,7 @@ function drawCarteiraViva() {
         <div class="cv-head">
           <span class="pill">${escapeHtml(p.code)}</span>
           <span class="cv-name" title="${escapeHtml(p.nome || p.code)}">${escapeHtml(p.nome || p.code)}</span>
-          <span class="cv-src ${live ? 'live' : ''}">${live ? '● ao vivo' : 'planilha'}</span>
+          <span class="cv-src ${live ? 'live' : (rfAutoBadge ? 'auto' : '')}" ${rfAutoBadge ? `title="Valor projetado via CDI/IPCA real (BACEN) a partir da taxa contratada${rfAutoBadge==='parcial'?' — parcialmente, algumas linhas usam a planilha':''}"` : ''}>${live ? '● ao vivo' : (rfAutoBadge ? '● auto' : 'planilha')}</span>
         </div>
         <div class="cv-classe">${escapeHtml(p.tipo || '—')}</div>
         <div class="cv-price-row">${priceHtml}</div>
@@ -2113,6 +2126,7 @@ function isDolarizado(tipo, investingVal) {
 
 function buildPositions(rows) {
   const byCode = {};
+  const _rfHoje = new Date(); // data de referência única para toda a projeção de RF nesta chamada
   // Reset debug counters
   _dateParseFailures = 0; _dateParseSuccess = 0; _dateSamples = [];
   // Log de migrações aplicadas (para auditoria)
@@ -2169,7 +2183,15 @@ function buildPositions(rows) {
     else if (op.includes('venda') || op === 'v') c.totalQtd -= r.quantidade;
     // Aporte, Atual: SOMAR todas as linhas
     c.totalAporte += r.aporte;
-    c.totalAtual  += r.atual;
+    // v12: para RF, tenta projetar o valor atual via CDI/IPCA real (BACEN) em vez do
+    // ATUAL_BRL manual da planilha. Cai no valor manual se a taxa não for reconhecida
+    // ou faltar dado — nunca fica sem valor.
+    let atualEfetivo = r.atual;
+    if (STATE.settings.rfAutoUpdate && RV_CLASSES.indexOf(tipoMigrado) === -1) {
+      const projetado = projetarValorRFLinha(r, _rfHoje);
+      if (projetado != null && projetado > 0) { atualEfetivo = projetado; c.rfAutoCount = (c.rfAutoCount||0) + 1; }
+    }
+    c.totalAtual += atualEfetivo;
     // TX_OPE: consolidado (Modelo Unificado: TX_OPE direto; Modelo A: Taxas + IR)
     c.totalTxOpe += (r.tx_ope || 0);
     // APORTE_USD (INVESTING): somar
@@ -2247,6 +2269,9 @@ function buildPositions(rows) {
       vencimento: c.vencimento || '',
       tx_rent_raw: c.tx_rent_raw || '',
       tx_rent_parsed: c.tx_rent_parsed || { tipo: null, valor: 0, spread: null, raw: '' },
+      // v12: indica se o valor atual veio (total ou parcialmente) da projeção automática
+      // de RF, para exibir o selo "auto" na Carteira Viva em vez de "planilha"
+      rfAuto: (c.rfAutoCount || 0) > 0 ? ((c.rfAutoCount === c.nRows) ? 'total' : 'parcial') : null,
       totalQtd,
       pm,
       aporte,
@@ -3631,8 +3656,13 @@ async function loadData(forceRefresh = false) {
     // Montar range com a aba do cliente (se especificada)
     const aba = STATE.currentClient.aba || 'A1:P10000';
     const range = aba.includes('!') ? aba : `${aba}!A1:P10000`;
-    // Carregar dados da planilha do cliente usando a API Key da mestra
-    let rows = await loadSheet(STATE.currentClient.sheet_id, STATE.masterApiKey, range);
+    // Carregar dados da planilha do cliente (usando a API Key da mestra) e os indicadores do
+    // BACEN em paralelo — v12: buildPositions() precisa do CDI/IPCA (STATE.bacenData) ANTES de
+    // rodar, para poder projetar automaticamente o valor atual de renda fixa.
+    let [rows] = await Promise.all([
+      loadSheet(STATE.currentClient.sheet_id, STATE.masterApiKey, range),
+      loadBacenData(forceRefresh),
+    ]);
     STATE.rawRows = rows;
     STATE.positions = buildPositions(rows);
     // Retry automático (v11): células com fórmula GOOGLEFINANCE (ATUAL_BRL de ações/
@@ -3640,7 +3670,9 @@ async function loadData(forceRefresh = false) {
     // que a API do Sheets é consultada, e voltam em branco/zero nessa primeira leitura
     // — mesmo com APORTE e QTD corretos. Detectamos esse padrão (posição de RV com
     // aporte > 0 e valor atual zerado) e refazemos UMA leitura extra após uma pequena
-    // pausa, que normalmente já vem com os valores recalculados.
+    // pausa, que normalmente já vem com os valores recalculados. (Não afeta RF: essa
+    // classe agora é projetada localmente via CDI/IPCA — ver v12 — e não depende do
+    // GOOGLEFINANCE da planilha.)
     const zeradosSuspeitos = STATE.positions.filter(p => RV_CLASSES.includes(p.tipo) && p.aporte > 0 && p.atual === 0);
     if (zeradosSuspeitos.length) {
       console.warn('[Dashboard] Posições com ATUAL_BRL zerado (fórmula GOOGLEFINANCE provavelmente ainda recalculando):',
@@ -3675,10 +3707,6 @@ async function loadData(forceRefresh = false) {
     populateFilters();
     document.getElementById('lastUpdate').textContent = `${STATE.currentClient.nome} · ${STATE.positions.length} ativos · ${new Date().toLocaleString('pt-BR')}`;
     document.getElementById('clientName').textContent = STATE.currentClient.nome;
-    // Carregar benchmarks e dados macro (em paralelo para performance)
-    await Promise.all([
-      loadBacenData(forceRefresh),
-    ]);
     renderAll();
     showLoading(false);
   } catch(e) {
@@ -3852,6 +3880,91 @@ function parseTxRent(raw) {
   }
   // Não reconhecido
   return { tipo: null, valor: 0, spread: null, raw: s };
+}
+
+/* ════════════════════════════════════════════════════════════════
+   RENDA FIXA AUTO-ATUALIZADA (v12) — projeção via CDI/IPCA real (BACEN)
+   ════════════════════════════════════════════════════════════════
+   Em vez de depender de atualização manual da coluna ATUAL_BRL na planilha,
+   projetamos o valor atual de cada título de RF compondo a taxa CONTRATADA
+   (TX_RENT, já interpretada por parseTxRent) sobre a série real do BACEN
+   desde a data do aporte (DATA_MOV) até hoje.
+   - Pós-fixado ("115% CDI"): compõe dia a dia a taxa CDI (série 4389) × % contratado.
+   - IPCA+ ("IPCA + 6,20%"): compõe o IPCA mensal acumulado (série 433) × o spread
+     fixo anualizado.
+   - Prefixado ("14,50% a.a."): juros compostos simples sobre os dias corridos.
+   Se a taxa não for reconhecida, ou faltar data/BACEN, cai no valor manual da
+   planilha (ATUAL_BRL) — nunca deixamos a posição sem valor.
+   Ativável/desativável em ⚙ Configurações (STATE.settings.rfAutoUpdate).
+*/
+
+// Converte taxa anual (% a.a.) em taxa diária composta (convenção 252 dias úteis/ano)
+function dailyRateFromAnnual(annualPct) {
+  return Math.pow(1 + annualPct / 100, 1 / 252) - 1;
+}
+
+// Projeta um aporte pós-fixado (% do CDI) compondo a série diária real do BACEN.
+// Para o período anterior ao início da série disponível (2 anos), aproxima usando
+// a primeira taxa conhecida — evita subestimar títulos mais antigos.
+function accrueCDI(aporte, dataInicio, hoje, pctCDI, cdiSeries) {
+  if (!(aporte > 0) || !dataInicio || !cdiSeries || !cdiSeries.length) return null;
+  let valor = aporte;
+  const primeira = cdiSeries[0];
+  if (dataInicio < primeira.date) {
+    const diasFaltantes = Math.round((primeira.date - dataInicio) / 86400000);
+    const fatorDiario = dailyRateFromAnnual(primeira.valor) * (pctCDI / 100);
+    valor *= Math.pow(1 + fatorDiario, Math.max(0, diasFaltantes));
+  }
+  for (const s of cdiSeries) {
+    if (s.date < dataInicio || s.date > hoje) continue;
+    const fatorDiario = dailyRateFromAnnual(s.valor) * (pctCDI / 100);
+    valor *= (1 + fatorDiario);
+  }
+  return valor;
+}
+
+// Projeta um aporte prefixado (juros compostos simples sobre dias corridos / 365)
+function accruePrefixado(aporte, dataInicio, hoje, taxaAnual) {
+  if (!(aporte > 0) || !dataInicio) return null;
+  const dias = (hoje - dataInicio) / 86400000;
+  if (dias <= 0) return aporte;
+  return aporte * Math.pow(1 + taxaAnual / 100, dias / 365);
+}
+
+// Projeta um aporte IPCA+ compondo o IPCA mensal real (BACEN) e aplicando o spread
+// fixo anualizado sobre os dias corridos.
+function accrueIPCA(aporte, dataInicio, hoje, spreadAnual, ipcaSeries) {
+  if (!(aporte > 0) || !dataInicio) return null;
+  let fatorIpca = 1;
+  if (ipcaSeries && ipcaSeries.length) {
+    for (const s of ipcaSeries) {
+      if (s.date < dataInicio || s.date > hoje) continue;
+      fatorIpca *= (1 + s.valor / 100);
+    }
+  }
+  const dias = (hoje - dataInicio) / 86400000;
+  const fatorSpread = Math.pow(1 + spreadAnual / 100, Math.max(0, dias) / 365);
+  return aporte * fatorIpca * fatorSpread;
+}
+
+// Tenta projetar o valor atual de UMA linha de RF. Retorna null se não for possível
+// (taxa não reconhecida, sem data, ou sem série do BACEN carregada) — quem chama deve
+// então usar o ATUAL_BRL manual da planilha como fallback.
+function projetarValorRFLinha(row, hoje) {
+  const parsed = row.tx_rent_parsed;
+  if (!parsed || !parsed.tipo || !(row.aporte > 0) || !row._date) return null;
+  if (parsed.tipo === 'cdi') {
+    const serie = STATE.bacenData?.cdi?.series;
+    return accrueCDI(row.aporte, row._date, hoje, parsed.valor, serie);
+  }
+  if (parsed.tipo === 'prefixado') {
+    return accruePrefixado(row.aporte, row._date, hoje, parsed.valor);
+  }
+  if (parsed.tipo === 'ipca') {
+    const serie = STATE.bacenData?.ipca?.series;
+    return accrueIPCA(row.aporte, row._date, hoje, parsed.valor, serie);
+  }
+  return null;
 }
 
 // Extrai TX_RENT do NOME via regex (fallback quando coluna TX_RENT não existe ou está vazia)
@@ -4511,12 +4624,13 @@ document.getElementById('selectClientBtn').addEventListener('click', async () =>
   const client = STATE.clientsList.find(c => c.cliente_id === clienteId);
   if (!client) { errEl.style.display='block'; errEl.textContent='Cliente não encontrado.'; return; }
   STATE.currentClient = client;
-  // Aplicar config personalizada do cliente (se existir)
-  applyClientConfig(client);
-  // Aplicar perfil do investidor — substitui classTargets pelos alvos do perfil
-  // Bug fix: sem isso, classTargets default (ANS=20%, ETF Int=40%) sobrescreve os alvos
-  // do perfil via getClassTargetsForActiveProfile(), gerando aderência incorreta
+  // Aplicar perfil do investidor — define os alvos-base (classTargets) conforme o perfil
   applyPerfilToSettings(STATE.settings.perfil || 'Conservador');
+  // Aplicar config personalizada do cliente (se existir) — SOBRESCREVE os alvos do perfil
+  // com os valores específicos do CONFIG_JSON dessa linha na planilha-mestra.
+  // Ordem corrigida (v13): antes o applyPerfilToSettings rodava DEPOIS e apagava a
+  // personalização por engano — agora config_json sempre vence quando presente.
+  applyClientConfig(client);
   // Carregar dados do cliente
   showLoading(true);
   try {
@@ -4674,8 +4788,10 @@ function applyClientConfig(client) {
 document.getElementById('btnReload').addEventListener('click', async () => {
   showToast('Atualizando dados (ignorando cache)...', 'info');
   STATE.brapi.forceNext = true; // próxima rodada da Carteira Viva ignora o cache Brapi
-  // Reaplica perfil para garantir que classTargets está sincronizado
+  // Reaplica perfil (base) e, por cima, o config_json do cliente atual (personalização) —
+  // mesma correção de ordem do v13, para o "Atualizar" não apagar a personalização também.
   applyPerfilToSettings(STATE.settings.perfil || 'Conservador');
+  if (STATE.currentClient) applyClientConfig(STATE.currentClient);
   await loadData(true); // forceRefresh = true — ignora cache
   showToast('Dados atualizados · ' + STATE.positions.length + ' ativos', 'success');
 });
@@ -4897,6 +5013,7 @@ document.getElementById('btnSettings').addEventListener('click', () => {
   document.getElementById('perfilAlvoLabel').textContent = `(perfil: ${STATE.settings.perfil || 'Conservador'})`;
   document.getElementById('brapiEnabledChk').checked = !!STATE.settings.brapiEnabled;
   document.getElementById('brapiTokenInput').value = STATE.settings.brapiToken || '';
+  document.getElementById('rfAutoUpdateChk').checked = !!STATE.settings.rfAutoUpdate;
   document.getElementById('settingsModal').classList.add('active');
 });
 
@@ -4931,6 +5048,11 @@ document.getElementById('btnSaveSettings').addEventListener('click', async () =>
   STATE.settings.brapiEnabled = newBrapiEnabled;
   saveBrapiTokenLocal(newBrapiToken); // persiste só no navegador local — nunca no repositório
   if (brapiChanged) STATE.brapi.forceNext = true;
+  // Renda Fixa automática (v12)
+  const newRfAutoUpdate = document.getElementById('rfAutoUpdateChk').checked;
+  const rfAutoChanged = newRfAutoUpdate !== STATE.settings.rfAutoUpdate;
+  STATE.settings.rfAutoUpdate = newRfAutoUpdate;
+  if (rfAutoChanged && STATE.currentClient) { loadData(true); }
   document.getElementById('settingsModal').classList.remove('active');
   showToast('Configurações salvas para <strong>' + (STATE.currentClient ? STATE.currentClient.nome : 'cliente') + '</strong>', 'success');
   if (benchChanged) {
