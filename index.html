@@ -1534,7 +1534,7 @@ const ASSESSOR_PASSWORD = 'assessor2025';
    Botão "Atualizar" ignora o cache (force refresh).
 */
 // Versão do cache — bump quando há mudança de formato que invalida dados antigos
-const CACHE_VERSION = 'v13'; // v13: corrige ordem perfil→config_json (personalização do cliente não era mais apagada)
+const CACHE_VERSION = 'v14.1'; // v14.1: aporte nunca sobra — excedente redistribuído pelos alvos
 const CACHE_PREFIX = `dash_cache_${CACHE_VERSION}_`;
 const CACHE_TTL = {
   bacen: 24 * 60 * 60 * 1000,      // 24 horas
@@ -2628,11 +2628,19 @@ function computeMacroAllocation(positions, totalPatrim) {
 */
 function computeRecommendations(positions, totalPatrim, aporteTotal) {
   const { byMacro } = computeMacroAllocation(positions, totalPatrim);
+  // Blindagem (v14): valor de aporte inválido/negativo é tratado como zero — evita
+  // recomendações absurdas (ex: "comprar -R$ 30") se o campo receber um valor ruim.
+  aporteTotal = (typeof aporteTotal === 'number' && isFinite(aporteTotal) && aporteTotal > 0) ? aporteTotal : 0;
+  // v14: a distância até a meta de cada classe agora é calculada sobre o patrimônio
+  // FUTURO (atual + o aporte previsto), não só o atual. Isso reflete corretamente
+  // onde a carteira vai ficar depois do aporte — antes, uma classe podia ser
+  // considerada "no alvo" mesmo que o aporte fosse desequilibrá-la (ou vice-versa).
+  const totalNovo = totalPatrim + aporteTotal;
   // Coleta todas as classes com distância positiva
   const classCandidates = [];
   Object.entries(byMacro).forEach(([macro, mData]) => {
     Object.entries(mData.classes).forEach(([cls, cd]) => {
-      const distance = Math.max(0, (cd.target / 100 * totalPatrim) - cd.current);
+      const distance = Math.max(0, (cd.target / 100 * totalNovo) - cd.current);
       if (distance > 0.01) {
         classCandidates.push({
           macro,
@@ -2685,7 +2693,49 @@ function computeRecommendations(positions, totalPatrim, aporteTotal) {
     const eq = aporteTotal / top.length;
     allocations.forEach(a => a.aporte = eq);
   }
-  // Recalcula remaining (o que sobrou sem conseguir alocar)
+  // v14.1: NUNCA sobrar aporte. Se após o water-filling ainda restar valor (ou seja,
+  // o aporte é maior do que o necessário para TODAS as classes atingirem a meta —
+  // inclusive o caso em que a carteira já está no alvo e não há distância nenhuma),
+  // o excedente é distribuído proporcionalmente aos ALVOS de cada classe. Assim a
+  // carteira já entra rebalanceada e permanece na proporção-alvo depois do aporte.
+  let sobra = aporteTotal - allocations.reduce((s, a) => s + a.aporte, 0);
+  if (sobra > 0.01) {
+    const classTargets = getClassTargetsForActiveProfile();
+    // Respeita o seletor "Qtd. Classes" (recCount): o excedente é dividido entre as
+    // MESMAS classes já escolhidas. Se nenhuma estava abaixo do alvo (carteira já
+    // equilibrada), escolhemos as N classes de maior peso-alvo para receber o aporte.
+    if (!allocations.length) {
+      Object.entries(classTargets)
+        .filter(([cls, t]) => t > 0 && getMacroForClass(cls))
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, n)
+        .forEach(([cls, t]) => {
+          const macro = getMacroForClass(cls);
+          const cd = (byMacro[macro] && byMacro[macro].classes[cls]) || null;
+          const current = cd ? cd.current : 0;
+          allocations.push({
+            macro, cls, current, target: t,
+            currentPct: totalPatrim > 0 ? (current / totalPatrim) * 100 : 0,
+            distance: 0, aporte: 0
+          });
+        });
+    }
+    const somaAlvos = allocations.reduce((s, a) => s + (a.target > 0 ? a.target : 0), 0);
+    if (somaAlvos > 0) {
+      allocations.forEach(a => {
+        if (a.target > 0) a.aporte += (a.target / somaAlvos) * sobra;
+      });
+      sobra = 0;
+    } else if (allocations.length) {
+      // Nenhuma das classes selecionadas tem alvo definido: divide igualmente
+      const eq = sobra / allocations.length;
+      allocations.forEach(a => { a.aporte += eq; });
+      sobra = 0;
+    }
+  }
+  // Reordena por valor de aporte (maior primeiro) para a exibição
+  allocations.sort((a, b) => b.aporte - a.aporte);
+  // Recalcula remaining — deve ser ~0 sempre que houver ao menos uma classe com alvo
   const totalAlloc = allocations.reduce((s, a) => s + a.aporte, 0);
   remaining = Math.max(0, aporteTotal - totalAlloc);
   return { recs: allocations, byMacro, remaining, totalAlloc };
