@@ -1534,7 +1534,7 @@ const ASSESSOR_PASSWORD = 'assessor2025';
    Botão "Atualizar" ignora o cache (force refresh).
 */
 // Versão do cache — bump quando há mudança de formato que invalida dados antigos
-const CACHE_VERSION = 'v14.1'; // v14.1: aporte nunca sobra — excedente redistribuído pelos alvos
+const CACHE_VERSION = 'v15'; // v15: múltiplos snapshots por cliente + aliases do Modelo B legado
 const CACHE_PREFIX = `dash_cache_${CACHE_VERSION}_`;
 const CACHE_TTL = {
   bacen: 24 * 60 * 60 * 1000,      // 24 horas
@@ -3768,7 +3768,7 @@ async function loadData(forceRefresh = false) {
     });
     populateFilters();
     document.getElementById('lastUpdate').textContent = `${STATE.currentClient.nome} · ${STATE.positions.length} ativos · ${new Date().toLocaleString('pt-BR')}`;
-    document.getElementById('clientName').textContent = STATE.currentClient.nome;
+    document.getElementById('clientName').textContent = clientBadgeLabel(STATE.currentClient);
     renderAll();
     showLoading(false);
   } catch(e) {
@@ -3811,26 +3811,31 @@ function parseSheetRows(allRows) {
     return -1;
   };
 
-  // === MAPEAMENTO POR NOME — apenas Modelo Unificado 1.0 ===
-  // 16 colunas oficiais: NOME, TICKER, OPERACAO, DATA_MOV, VENCIMENTO, LIQUIDEZ_DIAS,
-  //   CLASSE, TX_RENT, APORTE_BRL, APORTE_USD, ATUAL_BRL, LOCAL, TX_OPE, USDBRL_REF, QTD, PM
-  // Modelo A antigo não é mais suportado — planilhas devem ser migradas.
+  // === MAPEAMENTO POR NOME ===
+  // Modelo Unificado 1.0 (16 colunas): NOME, TICKER, OPERACAO, DATA_MOV, VENCIMENTO,
+  //   LIQUIDEZ_DIAS, CLASSE, TX_RENT, APORTE_BRL, APORTE_USD, ATUAL_BRL, LOCAL, TX_OPE,
+  //   USDBRL_REF, QTD, PM
+  // v15: aceitamos também os nomes do MODELO B legado como alias — abas antigas
+  // (ex.: Car_3, com TIPO/APORTE (R$)/ATUAL/QUANTIDADE/USD:BRL) antes não casavam por
+  // nome e caíam no fallback POSICIONAL, que lia a coluna errada como CLASSE
+  // (resultado: toda a carteira virava classe "C"/não conforme, silenciosamente).
+  // O alias é só um segundo nome: se o cabeçalho oficial existir, ele vence.
   let idx = {
     nome:      find('NOME'),
     cod:       find('TICKER'),
-    op:        find('OPERACAO'),
-    data:      find('DATA_MOV'),
+    op:        find('OPERACAO'),                       // 'OPERAÇÃO' normaliza p/ OPERACAO
+    data:      find('DATA_MOV', 'DATA'),
     venc:      find('VENCIMENTO'),
-    liq:       find('LIQUIDEZ_DIAS'),
-    tipo:      find('CLASSE'),
+    liq:       find('LIQUIDEZ_DIAS', 'LIQUIDEZ'),
+    tipo:      find('CLASSE', 'TIPO'),
     tx_rent:   find('TX_RENT'),
-    aporte:    find('APORTE_BRL'),
-    investing: find('APORTE_USD'),
-    atual:     find('ATUAL_BRL'),
+    aporte:    find('APORTE_BRL', 'APORTE (R$)', 'APORTE R$', 'APORTE'),
+    investing: find('APORTE_USD', 'INVESTING ($)', 'INVESTING'),
+    atual:     find('ATUAL_BRL', 'ATUAL'),
     local:     find('LOCAL'),
-    tx_ope:    find('TX_OPE'),
-    usd:       find('USDBRL_REF'),
-    qtd:       find('QTD'),
+    tx_ope:    find('TX_OPE', 'TAXAS'),
+    usd:       find('USDBRL_REF', 'USD:BRL', 'USD BRL'),
+    qtd:       find('QTD', 'QUANTIDADE'),
     pm:        find('PM'),
   };
 
@@ -4681,9 +4686,11 @@ document.getElementById('splashBtn').addEventListener('click', async () => {
 document.getElementById('selectClientBtn').addEventListener('click', async () => {
   const errEl = document.getElementById('splashErr2');
   errEl.style.display = 'none';
-  const clienteId = document.getElementById('clientSelect').value;
-  if (!clienteId) { errEl.style.display='block'; errEl.textContent='Selecione um cliente.'; return; }
-  const client = STATE.clientsList.find(c => c.cliente_id === clienteId);
+  const clienteKey = document.getElementById('clientSelect').value;
+  if (!clienteKey) { errEl.style.display='block'; errEl.textContent='Selecione um cliente.'; return; }
+  // v15: a chave é cliente_id::aba (um cliente pode ter vários snapshots na mestra)
+  const client = STATE.clientsList.find(c => c.key === clienteKey)
+              || STATE.clientsList.find(c => c.cliente_id === clienteKey); // retrocompat
   if (!client) { errEl.style.display='block'; errEl.textContent='Cliente não encontrado.'; return; }
   STATE.currentClient = client;
   // Aplicar perfil do investidor — define os alvos-base (classTargets) conforme o perfil
@@ -4701,7 +4708,7 @@ document.getElementById('selectClientBtn').addEventListener('click', async () =>
     if (STATE.positions.length) {
       document.getElementById('splash').style.display = 'none';
       document.getElementById('app').classList.add('active');
-      document.getElementById('clientName').textContent = client.nome;
+      document.getElementById('clientName').textContent = clientBadgeLabel(client);
       renderSettingsTargets();
       showToast(`<strong>${client.nome}</strong> carregado com sucesso · ${STATE.positions.length} ativos`, 'success');
       // Marca body com bottom-nav se mobile
@@ -4819,13 +4826,72 @@ async function loadClientsList() {
       config_json:String(r[idx.config_json>=0?idx.config_json:5]||'').trim(),
     }))
     .filter(c => c.cliente_id && c.nome && c.sheet_id && c.status === 'ativo');
+  // v15: um MESMO cliente pode ter várias linhas na mestra — uma por snapshot/data
+  // (ex.: C0001 com Car_1, Car_1.07.2026, Car_1.08.2026). Antes o dropdown usava
+  // cliente_id como value e o find() devolvia sempre a PRIMEIRA linha, tornando os
+  // snapshots inacessíveis. Agora cada linha tem uma chave única (cliente_id::aba).
+  clients.forEach(c => {
+    c.key = `${c.cliente_id}::${c.aba}`;
+    c.snapshot = parseSnapshotFromAba(c.aba); // {label, sortKey} ou null
+  });
+  // Ordena: por cliente, e dentro do cliente do snapshot mais recente para o mais antigo
+  clients.sort((a, b) => {
+    if (a.cliente_id !== b.cliente_id) return a.cliente_id.localeCompare(b.cliente_id);
+    return (b.snapshot?.sortKey || '') .localeCompare(a.snapshot?.sortKey || '');
+  });
   STATE.clientsList = clients;
-  // Popular dropdown
+  // Quantos snapshots cada cliente tem (para decidir se mostra o rótulo de data)
+  const countByClient = {};
+  clients.forEach(c => { countByClient[c.cliente_id] = (countByClient[c.cliente_id]||0) + 1; });
+  // Popular dropdown — agrupado por cliente quando há mais de um snapshot
   const sel = document.getElementById('clientSelect');
-  sel.innerHTML = clients.length
-    ? '<option value="">— Selecione um cliente —</option>' + clients.map(c => `<option value="${c.cliente_id}">${c.cliente_id} — ${c.nome}</option>`).join('')
-    : '<option value="">Nenhum cliente ativo encontrado</option>';
-  document.getElementById('clientsCount').textContent = `${clients.length} cliente(s) ativo(s)`;
+  if (!clients.length) {
+    sel.innerHTML = '<option value="">Nenhum cliente ativo encontrado</option>';
+  } else {
+    let html = '<option value="">— Selecione um cliente —</option>';
+    const jaAberto = {};
+    clients.forEach(c => {
+      const multi = countByClient[c.cliente_id] > 1;
+      if (multi && !jaAberto[c.cliente_id]) {
+        if (Object.keys(jaAberto).length) html += '</optgroup>';
+        html += `<optgroup label="${escapeHtml(c.cliente_id)} — ${escapeHtml(c.nome)}">`;
+        jaAberto[c.cliente_id] = true;
+      }
+      const rotulo = multi
+        ? `${c.snapshot ? c.snapshot.label : c.aba}`
+        : `${c.cliente_id} — ${c.nome}`;
+      html += `<option value="${escapeHtml(c.key)}">${escapeHtml(rotulo)}</option>`;
+    });
+    if (Object.keys(jaAberto).length) html += '</optgroup>';
+    sel.innerHTML = html;
+  }
+  const nClientes = Object.keys(countByClient).length;
+  const nSnapshots = clients.length;
+  document.getElementById('clientsCount').textContent = nSnapshots > nClientes
+    ? `${nClientes} cliente(s) · ${nSnapshots} carteira(s)/data(s)`
+    : `${nClientes} cliente(s) ativo(s)`;
+}
+
+// v15: rótulo do cliente no cabeçalho, incluindo a data do snapshot quando houver
+// mais de uma carteira/data para o mesmo cliente na mestra.
+function clientBadgeLabel(client) {
+  if (!client) return '—';
+  const irmaos = (STATE.clientsList || []).filter(c => c.cliente_id === client.cliente_id);
+  if (irmaos.length > 1 && client.snapshot) return `${client.nome} · ${client.snapshot.label}`;
+  return client.nome;
+}
+
+// v15: extrai a data de um nome de aba de snapshot.
+// "Car_1.08.2026" → { label: "08/2026", sortKey: "2026-08" }
+// "Car_1"         → { label: "Base (atual)", sortKey: "9999-99" }  ← sempre no topo
+function parseSnapshotFromAba(aba) {
+  if (!aba) return null;
+  const m = String(aba).match(/(\d{1,2})[.\-\/](\d{4})\s*$/);
+  if (m) {
+    const mes = m[1].padStart(2, '0');
+    return { label: `${mes}/${m[2]}`, sortKey: `${m[2]}-${mes}` };
+  }
+  return { label: `${aba} (base)`, sortKey: '9999-99' };
 }
 
 // Aplica configuração personalizada do cliente (se existir no config_json)
