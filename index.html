@@ -1534,7 +1534,7 @@ const ASSESSOR_PASSWORD = 'assessor2025';
    Botão "Atualizar" ignora o cache (force refresh).
 */
 // Versão do cache — bump quando há mudança de formato que invalida dados antigos
-const CACHE_VERSION = 'v15'; // v15: múltiplos snapshots por cliente + aliases do Modelo B legado
+const CACHE_VERSION = 'v15.1'; // v15.1: snapshots são históricos (sem projeção RF nem cotação ao vivo) + guarda de divergência
 const CACHE_PREFIX = `dash_cache_${CACHE_VERSION}_`;
 const CACHE_TTL = {
   bacen: 24 * 60 * 60 * 1000,      // 24 horas
@@ -1896,6 +1896,9 @@ function renderCarteiraViva(positions, totalPatrim) {
   // Busca assíncrona (cache torna barato) e redesenho ao concluir
   const force = STATE.brapi.forceNext; STATE.brapi.forceNext = false;
   const stale = force || (Date.now() - STATE.brapi.lastRun > 5 * 60 * 1000);
+  // v15.1: em aba de snapshot (retrato de uma data passada) não buscamos cotação ao
+  // vivo — o preço de hoje não pertence a uma carteira datada no passado.
+  if (STATE.currentClient && STATE.currentClient.isSnapshot) return;
   if (STATE.settings.brapiEnabled && stale && !STATE.brapi.running) {
     refreshBrapiQuotes(positions, force).then(() => drawCarteiraViva());
   }
@@ -1945,6 +1948,7 @@ function drawCarteiraViva() {
   // Status
   if (statusEl) {
     if (!STATE.settings.brapiEnabled) statusEl.textContent = 'Cotações ao vivo desativadas (⚙ Configurações)';
+    if (STATE.currentClient && STATE.currentClient.isSnapshot) statusEl.textContent = `Snapshot ${STATE.currentClient.snapshot.label} — valores históricos da planilha (sem cotação ao vivo)`;
     else if (!eligible.length) statusEl.textContent = 'Somente dados da planilha';
     else if (STATE.brapi.running) statusEl.textContent = 'Buscando cotações na Brapi…';
     else statusEl.textContent = `Brapi · ${liveCount}/${eligible.length} ao vivo · ${STATE.brapi.lastRun ? new Date(STATE.brapi.lastRun).toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit'}) : '—'}`;
@@ -4017,21 +4021,39 @@ function accrueIPCA(aporte, dataInicio, hoje, spreadAnual, ipcaSeries) {
 // Tenta projetar o valor atual de UMA linha de RF. Retorna null se não for possível
 // (taxa não reconhecida, sem data, ou sem série do BACEN carregada) — quem chama deve
 // então usar o ATUAL_BRL manual da planilha como fallback.
+// Divergência máxima tolerada entre o valor projetado e o ATUAL_BRL da planilha.
+// Acima disso, confiamos na planilha: divergência grande quase sempre significa que
+// houve AMORTIZAÇÃO/RESGATE PARCIAL (o APORTE_BRL continua o original, mas a posição
+// atual é bem menor) — algo que a projeção, partindo do aporte, não tem como saber.
+const RF_DIVERGENCIA_MAX = 0.35; // 35%
+
 function projetarValorRFLinha(row, hoje) {
   const parsed = row.tx_rent_parsed;
   if (!parsed || !parsed.tipo || !(row.aporte > 0) || !row._date) return null;
+  // v15.1 — Guarda 1: aba de SNAPSHOT é um retrato de uma data passada. Projetar até
+  // hoje reescreveria o passado. Nesses casos o ATUAL_BRL da planilha é a verdade.
+  if (STATE.currentClient && STATE.currentClient.isSnapshot) return null;
+  let valor = null;
   if (parsed.tipo === 'cdi') {
     const serie = STATE.bacenData?.cdi?.series;
-    return accrueCDI(row.aporte, row._date, hoje, parsed.valor, serie);
-  }
-  if (parsed.tipo === 'prefixado') {
-    return accruePrefixado(row.aporte, row._date, hoje, parsed.valor);
-  }
-  if (parsed.tipo === 'ipca') {
+    valor = accrueCDI(row.aporte, row._date, hoje, parsed.valor, serie);
+  } else if (parsed.tipo === 'prefixado') {
+    valor = accruePrefixado(row.aporte, row._date, hoje, parsed.valor);
+  } else if (parsed.tipo === 'ipca') {
     const serie = STATE.bacenData?.ipca?.series;
-    return accrueIPCA(row.aporte, row._date, hoje, parsed.valor, serie);
+    valor = accrueIPCA(row.aporte, row._date, hoje, parsed.valor, serie);
   }
-  return null;
+  if (valor == null || !(valor > 0)) return null;
+  // v15.1 — Guarda 2: se a planilha traz um ATUAL_BRL e a projeção diverge demais dele,
+  // descartamos a projeção (provável amortização/resgate parcial) e usamos a planilha.
+  if (row.atual > 0) {
+    const divergencia = Math.abs(valor - row.atual) / row.atual;
+    if (divergencia > RF_DIVERGENCIA_MAX) {
+      console.warn(`[RF Auto] ${row.nome || row.codigo}: projeção ${valor.toFixed(2)} diverge ${(divergencia*100).toFixed(0)}% do ATUAL_BRL ${row.atual.toFixed(2)} — usando a planilha (provável amortização/resgate parcial).`);
+      return null;
+    }
+  }
+  return valor;
 }
 
 // Extrai TX_RENT do NOME via regex (fallback quando coluna TX_RENT não existe ou está vazia)
@@ -4833,6 +4855,9 @@ async function loadClientsList() {
   clients.forEach(c => {
     c.key = `${c.cliente_id}::${c.aba}`;
     c.snapshot = parseSnapshotFromAba(c.aba); // {label, sortKey} ou null
+    // v15.1: aba com data no nome (Car_1.08.2026) é um retrato histórico. Marcamos
+    // para desligar a projeção de RF — o valor da planilha é a verdade daquela data.
+    c.isSnapshot = !!(c.snapshot && c.snapshot.sortKey !== '9999-99');
   });
   // Ordena: por cliente, e dentro do cliente do snapshot mais recente para o mais antigo
   clients.sort((a, b) => {
