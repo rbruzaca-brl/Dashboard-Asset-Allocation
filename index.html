@@ -1534,7 +1534,7 @@ const ASSESSOR_PASSWORD = 'assessor2025';
    Botão "Atualizar" ignora o cache (force refresh).
 */
 // Versão do cache — bump quando há mudança de formato que invalida dados antigos
-const CACHE_VERSION = 'v15.1'; // v15.1: snapshots são históricos (sem projeção RF nem cotação ao vivo) + guarda de divergência
+const CACHE_VERSION = 'v15.2'; // v15.2: linhas sem DATA_MOV entram como saldo de abertura; PL vem das posições
 const CACHE_PREFIX = `dash_cache_${CACHE_VERSION}_`;
 const CACHE_TTL = {
   bacen: 24 * 60 * 60 * 1000,      // 24 horas
@@ -2316,7 +2316,31 @@ function buildPositions(rows) {
 function buildHistory(rows, positions) {
   // Ordenar todas as linhas por data
   const sorted = [...rows].filter(r => r._date).sort((a,b)=> a._date - b._date);
-  if (!sorted.length) return { series: [], dailyReturns: [] };  // ← retornar objeto vazio (não array)
+  // v15.2: linhas SEM DATA_MOV (muito comuns nas abas de snapshot, onde só alguns
+  // ativos trazem a data da aplicação) eram simplesmente descartadas da série. Como o
+  // último ponto da série alimentava o card "Patrimônio Líquido", o patrimônio aparecia
+  // menor do que a soma real das posições. Agora essas linhas entram como SALDO DE
+  // ABERTURA: já existiam antes da primeira movimentação datada, então compõem todos os
+  // pontos do gráfico e o total final passa a bater com a Posição Consolidada.
+  const semData = rows.filter(r => !r._date);
+  const aberturaBruto  = semData.reduce((s, r) => s + (r.atual || 0), 0);
+  const aberturaTxOpe  = semData.reduce((s, r) => s + (r.tx_ope || 0), 0);
+  const aberturaAporte = semData.reduce((s, r) => s + (r.aporte || 0), 0);
+  if (semData.length) {
+    console.log(`[Dashboard] ${semData.length} linha(s) sem DATA_MOV somadas como saldo de abertura: ${aberturaBruto.toFixed(2)}`);
+  }
+  if (!sorted.length) {
+    // Nenhuma linha datada: série de um ponto só, com o total da carteira
+    if (!aberturaBruto) return { series: [], dailyReturns: [] };
+    return {
+      series: [{
+        date: new Date(), value: aberturaBruto, tx_ope: aberturaTxOpe, aporte: aberturaAporte,
+        valueLiq: aberturaBruto - aberturaTxOpe,
+        valueLiqAjustado: (aberturaBruto - aberturaTxOpe) - aberturaAporte,
+      }],
+      dailyReturns: [],
+    };
+  }
   // Cada linha da planilha representa uma operação parcial de um ativo.
   // Para cada data, o patrimônio total = SOMA de todos os ATUAL de todas as
   // linhas com data <= data atual (mesma lógica de somatório usada nas posições).
@@ -2328,7 +2352,7 @@ function buildHistory(rows, positions) {
   });
   const days = Object.values(byDay).sort((a,b)=> a.date - b.date);
   const series = [];
-  let cumBruto = 0, cumTxOpe = 0, cumAporte = 0;
+  let cumBruto = aberturaBruto, cumTxOpe = aberturaTxOpe, cumAporte = aberturaAporte;
   days.forEach(day => {
     day.rows.forEach(r => {
       cumBruto += r.atual;
@@ -2754,7 +2778,14 @@ function renderKPIs(positions, history) {
   const totalTxOpe = positions.reduce((s,p)=> s + (p.tx_ope || 0), 0);
   // Filtra histórico pelo período do toggle (1M/3M/6M/12M/ALL)
   const filteredHistory = filterHistoryByPeriod(history);
-  const lastLiquido = filteredHistory.length ? filteredHistory[filteredHistory.length-1].valueLiq : 0;
+  // v15.2: o card "Patrimônio Líquido" passa a usar a SOMA REAL das posições, e não o
+  // último ponto da série histórica. A série depende de DATA_MOV e pode estar incompleta;
+  // a soma das posições é a mesma base da Posição Consolidada, então os dois números
+  // nunca mais divergem. A série continua alimentando o gráfico e as métricas de período.
+  const totalLiquidoPositions = positions.reduce((s, p) => s + (p.valorLiquido != null ? p.valorLiquido : (p.valorMercado || 0)), 0);
+  const lastLiquido = totalLiquidoPositions > 0
+    ? totalLiquidoPositions
+    : (filteredHistory.length ? filteredHistory[filteredHistory.length-1].valueLiq : 0);
   // RETORNO NO PERÍODO via Modified Dietz (exclui aportes que inflacionam o patrimônio)
   const retAcum = computePeriodReturn(filteredHistory);
   const ganhoTotal = lastLiquido - totalInvestido;
